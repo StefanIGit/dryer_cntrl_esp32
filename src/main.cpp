@@ -24,7 +24,7 @@
 #endif
 
 constexpr bool kDebugEnabled = false;
-constexpr char kFirmwareVersion[] = "0.4.0";
+constexpr char kFirmwareVersion[] = "0.5.0";
 constexpr uint32_t kSerialBaudRate = 115200;
 constexpr uint16_t kWebServerPort = 80;
 constexpr char kWifiSetupSsid[] = "DryerController-Setup";

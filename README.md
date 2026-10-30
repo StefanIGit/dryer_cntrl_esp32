@@ -62,8 +62,11 @@ must provide a content length. The default PlatformIO build artifact is
 `.pio/build/wemos_d1_mini32/firmware.bin`.
 
 Firmware installation always requires the configured HTTP username and
-password, even when dashboard Basic Auth is disabled. Choose a `.bin` built for
-this board and do not interrupt power during installation.
+password, even when dashboard Basic Auth is disabled. This keeps firmware
+installation restricted to credential holders because an update can replace
+the device's software, while allowing Basic Auth to be disabled for ordinary
+dashboard and API access. Choose a `.bin` built for this board and do not
+interrupt power during installation.
 
 PlatformIO network upload is also available using ArduinoOTA, at hostname
 `dryer-controller.local`. It uses the configured HTTP password (not the
@@ -84,8 +87,10 @@ pio run -e wemos_d1_mini32_ota --target upload --upload-port 192.168.1.50
 unset PLATFORMIO_UPLOAD_FLAGS
 ```
 
-Keep the password out of tracked project files. Keep OTA on a trusted local
-network; it is not encrypted and should not be exposed to the internet.
+Keep the password out of tracked project files. Both the web updater and
+ArduinoOTA use unencrypted network transfers, and the dashboard uses HTTP, not
+HTTPS. Use them only on a trusted local network; do not expose the device
+directly to the internet.
 
 ## Usage
 

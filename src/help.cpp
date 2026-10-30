@@ -25,7 +25,7 @@ const char * modes = "Modes:\r\n"
 
 const char * params = "Parameters:\r\n"
                       "* temp:\r\n"
-                      "  * [get MODE] Get temperature from board ADC input. Unit is degrees Celcius.\r\n"
+                      "  * [get MODE] Get temperature from the GPIO 35 thermistor. Unit is degrees Celcius.\r\n"
                       "  * [set MODE] Set target temperature. Allowed values 45-65. Unit is degrees Celcius.\r\n"
                       "* time:\r\n"
                       "  * [get MODE] Get estimated time till finish. Counts time using software timer.\r\n"

@@ -7,7 +7,7 @@ The logic is mostly hardware-agnostic: it emulates the dryer encoder and communi
 - the Pico hardware timer (`add_alarm_in_us`, `cancel_alarm`)
 - the internal temperature read (`analogReadTemp()`)
 
-These have been replaced with an ESP32-friendly timer implementation and a generic ADC-based temperature read.
+These have been replaced with an ESP32-friendly timer implementation and a thermistor read on GPIO 35.
 
 ## Hardware notes
 
@@ -21,16 +21,29 @@ The original hardware seems to use the following wiring concept:
 
 Those are kept as the default GPIOs in the project, but you may need to remap them for your exact wiring and board variant.
 
-The ADC temperature read uses GPIO 35 by default. If your board or sensor arrangement differs, change `TEMP_PIN` in the sketch.
+GPIO 35 reads a 10 kΩ NTC thermistor using the Marlin type 4 beta value
+(B = 3950 K), with a 10 kΩ fixed pull-up to match the resistor already
+installed. Wire the divider from 3.3 V through the 10 kΩ resistor to a
+junction at GPIO 35, then connect the NTC from that junction to GND. Use the
+ESP32's 3.3 V supply, not 5 V. Change `thermistorPullupOhms` in `src/main.cpp`
+if the fixed resistor value changes. The conversion assumes a 3.3 V supply
+and nominal thermistor values, so verify it against a known temperature after
+wiring.
 
-## Build
+## Build and upload with PlatformIO
 
-Use the ESP32 Arduino core in Arduino IDE and select a board such as:
+Open this project in VS Code with the PlatformIO extension, or use the
+PlatformIO Core CLI from the project directory:
 
-- ESP32 Dev Module
-- ESP32 Mini-D32 (if available in your board package)
+```sh
+pio run
+pio run --target upload
+pio device monitor
+```
 
-Then compile and upload the sketch.
+The configured environment is `wemos_d1_mini32` and the serial monitor is set
+to 115200 baud. Change the board in `platformio.ini` if you are using a
+different ESP32 board.
 
 ## Usage
 
@@ -45,4 +58,10 @@ The command protocol is unchanged from the original project:
 - `set state stop`
 - `help`
 
-The board will speak over the USB serial console at 115200 baud.
+On first boot, connect to the `DryerController-Setup` Wi-Fi network and use
+the captive portal to select your home Wi-Fi network. Once connected, open the
+IP address printed to the serial console at 115200 baud to view the live dryer
+status page. The page shows the current state, the GPIO 35 thermistor reading,
+the ESP32 chip's internal temperature, target temperature, target time, and
+remaining time; it refreshes every five seconds. The chip temperature is the
+ESP32 die temperature, not the dryer temperature.

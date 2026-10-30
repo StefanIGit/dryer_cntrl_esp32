@@ -1,3 +1,10 @@
+#include <Arduino.h>
+#include <math.h>
+#include <stdarg.h>
+#include <WiFi.h>
+#include <WebServer.h>
+#include <WiFiManager.h>
+
 #include "HWTimer.h"
 #include "help.h"
 
@@ -6,6 +13,11 @@
 #define DEBUG false
 
 #define TEMP_PIN 35
+
+constexpr float thermistorPullupOhms = 10000.0f;
+constexpr float thermistorResistanceAt25C = 10000.0f;
+constexpr float thermistorBeta = 3950.0f;
+constexpr float thermistorSupplyMillivolts = 3300.0f;
 
 /* Available modes */
 enum Mode {
@@ -44,13 +56,35 @@ static uint8_t timeToSet = 0;
 
 /* Timer */
 HWTimer timer;
+WebServer webServer(80);
+
+void debugPrintf(const char* fmt, ...);
+void handleStatusPage();
+void handleStatusApi();
+void startWifiAndWebServer();
+void inputHandler(const String& input);
+void modeGetHandler(const String& paramStr);
+void modeSetHandler(const String& paramStr, const String& valueStr);
+void setTemp(const String& tempStr);
+void setTime(const String& timeStr);
+void setStatus(const String& stateStr);
+void resetStatus();
+void dial(Param param, uint8_t value);
+void rotateRight();
+void rotateLeft();
+void pressButton();
+void setPins(int a, int b);
 
 float analogReadTemp() {
-  const int raw = analogRead(TEMP_PIN);
-  const float voltage = raw * (3.3f / 4095.0f);
-  // Very rough fallback approximation for testing without a calibrated thermistor.
-  // Replace this with your actual temperature sensor calibration if needed.
-  return 25.0f + (voltage - 1.65f) * 100.0f;
+  const uint32_t voltageMillivolts = analogReadMilliVolts(TEMP_PIN);
+  if (voltageMillivolts == 0 || voltageMillivolts >= thermistorSupplyMillivolts)
+    return NAN;
+
+  const float thermistorResistance = thermistorPullupOhms * voltageMillivolts
+      / (thermistorSupplyMillivolts - voltageMillivolts);
+  const float inverseTemperatureKelvin = 1.0f / 298.15f
+      + logf(thermistorResistance / thermistorResistanceAt25C) / thermistorBeta;
+  return 1.0f / inverseTemperatureKelvin - 273.15f;
 }
 
 /**
@@ -65,6 +99,7 @@ void setup() {
   delay(1000);
 
   analogReadResolution(12);
+  startWifiAndWebServer();
   printHelp();
   Serial.println(ack);
 }
@@ -77,6 +112,7 @@ void loop() {
   static char ch;
 
   timer.update();
+  webServer.handleClient();
 
   if (!Serial.available())
     return;
@@ -106,6 +142,100 @@ void loop() {
   }
 
   input += ch;
+}
+
+void startWifiAndWebServer() {
+  WiFiManager wifiManager;
+  if (!wifiManager.autoConnect("DryerController-Setup")) {
+    Serial.println("ERR: Wi-Fi setup failed; restarting.");
+    delay(1000);
+    ESP.restart();
+    return;
+  }
+
+  webServer.on("/", HTTP_GET, handleStatusPage);
+  webServer.on("/api/status", HTTP_GET, handleStatusApi);
+  webServer.begin();
+
+  Serial.printf("Wi-Fi connected. Status page: http://%s/\r\n",
+                WiFi.localIP().toString().c_str());
+}
+
+void handleStatusPage() {
+  static const char page[] PROGMEM = R"html(
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta http-equiv="refresh" content="30">
+  <title>Filament Dryer Status</title>
+  <style>
+    body{font:16px system-ui,sans-serif;max-width:36rem;margin:3rem auto;padding:0 1rem;background:#f4f6f8;color:#18212b}
+    main{background:white;border-radius:12px;padding:1.5rem;box-shadow:0 2px 12px #17212b18}
+    h1{margin-top:0}.status{font-size:1.4rem;font-weight:700}
+    dl{display:grid;grid-template-columns:1fr auto;gap:.8rem;margin-bottom:0}
+    dt{color:#536273}dd{margin:0;font-weight:600}
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Filament Dryer</h1>
+    <p class="status" id="state">Loading…</p>
+    <dl>
+      <dt>GPIO 35 thermistor</dt><dd><span id="temperature">--</span> °C</dd>
+      <dt>ESP32 chip temperature</dt><dd><span id="chipTemperature">--</span> °C</dd>
+      <dt>Target temperature</dt><dd><span id="targetTemperature">--</span> °C</dd>
+      <dt>Target time</dt><dd><span id="targetTime">--</span> h</dd>
+      <dt>Time remaining</dt><dd id="timeRemaining">--</dd>
+    </dl>
+  </main>
+  <script>
+    async function refreshStatus() {
+      try {
+        const response = await fetch('/api/status', {cache: 'no-store'});
+        if (!response.ok) throw new Error('Status request failed');
+        const status = await response.json();
+        document.getElementById('state').textContent = status.state;
+        document.getElementById('temperature').textContent =
+          Number.isFinite(status.temperature) ? status.temperature.toFixed(1) : 'Sensor error';
+        document.getElementById('chipTemperature').textContent = status.chipTemperature.toFixed(1);
+        document.getElementById('targetTemperature').textContent = status.targetTemperature || 'Not set';
+        document.getElementById('targetTime').textContent = status.targetTime;
+        document.getElementById('timeRemaining').textContent = status.timeRemaining;
+      } catch (error) {
+        document.getElementById('state').textContent = 'Status unavailable';
+      }
+    }
+    refreshStatus();
+    setInterval(refreshStatus, 5000);
+  </script>
+</body>
+</html>
+)html";
+
+  webServer.send(200, "text/html; charset=utf-8", page);
+}
+
+void handleStatusApi() {
+  String json;
+  json.reserve(128);
+  json = "{\"state\":\"";
+  json += stateRunning ? "running" : "stopped";
+  json += "\",\"temperature\":";
+  const float temperature = analogReadTemp();
+  json += isfinite(temperature) ? String(temperature, 1) : "null";
+  json += ",\"chipTemperature\":";
+  json += String(temperatureRead(), 1);
+  json += ",\"targetTemperature\":";
+  json += String(tempToSet);
+  json += ",\"targetTime\":";
+  json += String(timeToSet);
+  json += ",\"timeRemaining\":\"";
+  json += timer.getTimeLeft();
+  json += "\"}";
+
+  webServer.send(200, "application/json; charset=utf-8", json);
 }
 
 /**
@@ -217,7 +347,13 @@ void inputHandler(const String& input) {
 void modeGetHandler(const String& paramStr) {
   switch (strToParam(paramStr)) {
     case PARAM_TEMP:
-      Serial.printf("%s:%2.1f\r\n", ack.c_str(), analogReadTemp());
+      {
+        const float temperature = analogReadTemp();
+        if (isfinite(temperature))
+          Serial.printf("%s:%2.1f\r\n", ack.c_str(), temperature);
+        else
+          Serial.printf("%s:Temperature sensor reading is out of range.\r\n", ackErr.c_str());
+      }
       break;
     case PARAM_TIME:
       Serial.printf("%s:%s\r\n", ack.c_str(), timer.getTimeLeft().c_str());

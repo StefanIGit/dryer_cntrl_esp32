@@ -1,6 +1,7 @@
-#include <Arduino.h>
 #include <math.h>
 #include <stdarg.h>
+
+#include <Arduino.h>
 #include <WiFi.h>
 #include <WebServer.h>
 #include <WiFiManager.h>
@@ -8,16 +9,27 @@
 #include "HWTimer.h"
 #include "help.h"
 
-#define NAME "Filament Dryer Automator"
-#define VERSION "0.0.1"
-#define DEBUG false
+constexpr bool kDebugEnabled = false;
+constexpr uint32_t kSerialBaudRate = 115200;
+constexpr uint16_t kWebServerPort = 80;
+constexpr char kWifiSetupSsid[] = "DryerController-Setup";
+constexpr size_t kDebugBufferSize = 255;
+constexpr uint16_t kStartupDelayMs = 1000;
+constexpr uint8_t kEncoderTransitionDelayMs = 1;
+constexpr uint16_t kEncoderPhaseDelayUs = 500;
+constexpr uint8_t kEncoderButtonPressMs = 50;
 
-#define TEMP_PIN 35
+constexpr uint8_t kTemperaturePin = 35;
+constexpr uint8_t kEncoderPinA = 27;
+constexpr uint8_t kEncoderPinB = 25;
+constexpr uint8_t kEncoderPinSwitch = 32;
 
-constexpr float thermistorPullupOhms = 10000.0f;
-constexpr float thermistorResistanceAt25C = 10000.0f;
-constexpr float thermistorBeta = 3950.0f;
-constexpr float thermistorSupplyMillivolts = 3300.0f;
+constexpr float kThermistorPullupOhms = 10000.0f;
+constexpr float kThermistorResistanceAt25C = 10000.0f;
+constexpr float kThermistorBeta = 3950.0f;
+constexpr float kThermistorSupplyMillivolts = 3300.0f;
+constexpr float kThermistorReferenceKelvin = 298.15f;
+constexpr float kKelvinOffset = 273.15f;
 
 /* Available modes */
 enum Mode {
@@ -36,18 +48,13 @@ enum Param {
 };
 
 /* Status messages */
-const String ackErr = "ERR";
-const String ack = "OK";
-
-/* GPIO definitions */
-const uint8_t pinA = 2; // Encoder A
-const uint8_t pinB = 3; // Encoder B
-const uint8_t pinSW = 4; // Switch
+const String kAckError = "ERR";
+const String kAck = "OK";
 
 /* Max values */
-const uint8_t minTemp = 45; // Degrees Celsius
-const uint8_t maxTemp = 65; // Degrees Celsius
-const uint8_t maxTime = 24; // Hours
+constexpr uint8_t kMinTemperature = 45; // Degrees Celsius
+constexpr uint8_t kMaxTemperature = 65; // Degrees Celsius
+constexpr uint8_t kMaxTimeHours = 24; // Hours
 
 /* Global params */
 static bool stateRunning = false;
@@ -56,7 +63,7 @@ static uint8_t timeToSet = 0;
 
 /* Timer */
 HWTimer timer;
-WebServer webServer(80);
+WebServer webServer(kWebServerPort);
 
 void debugPrintf(const char* fmt, ...);
 void handleStatusPage();
@@ -74,35 +81,35 @@ void dial(Param param, uint8_t value);
 void rotateRight();
 void rotateLeft();
 void pressButton();
-void setPins(int a, int b);
+void setPins(uint8_t a, uint8_t b);
 
 float analogReadTemp() {
-  const uint32_t voltageMillivolts = analogReadMilliVolts(TEMP_PIN);
-  if (voltageMillivolts == 0 || voltageMillivolts >= thermistorSupplyMillivolts)
+  const uint32_t voltageMillivolts = analogReadMilliVolts(kTemperaturePin);
+  if (voltageMillivolts == 0 || voltageMillivolts >= kThermistorSupplyMillivolts)
     return NAN;
 
-  const float thermistorResistance = thermistorPullupOhms * voltageMillivolts
-      / (thermistorSupplyMillivolts - voltageMillivolts);
-  const float inverseTemperatureKelvin = 1.0f / 298.15f
-      + logf(thermistorResistance / thermistorResistanceAt25C) / thermistorBeta;
-  return 1.0f / inverseTemperatureKelvin - 273.15f;
+  const float thermistorResistance = kThermistorPullupOhms * voltageMillivolts
+      / (kThermistorSupplyMillivolts - voltageMillivolts);
+  const float inverseTemperatureKelvin = 1.0f / kThermistorReferenceKelvin
+      + logf(thermistorResistance / kThermistorResistanceAt25C) / kThermistorBeta;
+  return 1.0f / inverseTemperatureKelvin - kKelvinOffset;
 }
 
 /**
  * @brief Arduino setup() function. Runs one.
  */
 void setup() {
-  pinMode(pinA, INPUT);
-  pinMode(pinB, INPUT);
-  pinMode(pinSW, INPUT);
+  pinMode(kEncoderPinA, INPUT);
+  pinMode(kEncoderPinB, INPUT);
+  pinMode(kEncoderPinSwitch, INPUT);
 
-  Serial.begin(115200);
-  delay(1000);
+  Serial.begin(kSerialBaudRate);
+  delay(kStartupDelayMs);
 
   analogReadResolution(12);
   startWifiAndWebServer();
   printHelp();
-  Serial.println(ack);
+  Serial.println(kAck);
 }
 
 /**
@@ -110,7 +117,6 @@ void setup() {
  */
 void loop() {
   static String input;
-  static char ch;
 
   timer.update();
   webServer.handleClient();
@@ -118,7 +124,7 @@ void loop() {
   if (!Serial.available())
     return;
 
-  ch = Serial.read();
+  const char ch = Serial.read();
   Serial.write(ch);
 
   switch (ch) {
@@ -138,7 +144,8 @@ void loop() {
       return;
     case '\b':
       Serial.print(" \b");
-      input.remove(input.length() - 1);
+      if (!input.isEmpty())
+        input.remove(input.length() - 1);
       return;
   }
 
@@ -147,7 +154,7 @@ void loop() {
 
 void startWifiAndWebServer() {
   WiFiManager wifiManager;
-  if (!wifiManager.autoConnect("DryerController-Setup")) {
+  if (!wifiManager.autoConnect(kWifiSetupSsid)) {
     Serial.println("ERR: Wi-Fi setup failed; restarting.");
     delay(1000);
     ESP.restart();
@@ -345,21 +352,19 @@ void handleCommandApi() {
   }
 
   const String response = inputHandler(command);
-  const bool failed = response.startsWith(ackErr);
+  const bool failed = response.startsWith(kAckError);
   webServer.send(failed ? 400 : 200, "text/plain; charset=utf-8", response);
 }
 
 /**
- * @brief Print message on Serial only if DEBUG is enabled.
+ * @brief Print message on Serial only when debugging is enabled.
  *
  * @param fmt message.
  * @param ... additional parameters.
  */
 void debugPrintf(const char* fmt, ...) {
-  const uint8_t buff_size = 255;
-
-  if (DEBUG) {
-    char buffer[buff_size];
+  if (kDebugEnabled) {
+    char buffer[kDebugBufferSize];
     va_list args;
     va_start(args, fmt);
     vsnprintf(buffer, sizeof(buffer), fmt, args);
@@ -436,14 +441,14 @@ String inputHandler(const String& input) {
       return modeSetHandler(param, value);
     case MODE_UNKNOWN:
       if (input != "") {
-        return ackErr + ":\"" + input + "\" is not a valid mode.";
+        return kAckError + ":\"" + input + "\" is not a valid mode.";
       }
-      return ack;
+      return kAck;
     case MODE_HELP:
       printHelp();
-      return ack;
+      return kAck;
   }
-  return ackErr + ":Invalid command.";
+  return kAckError + ":Invalid command.";
 }
 
 /**
@@ -457,17 +462,17 @@ String modeGetHandler(const String& paramStr) {
       {
         const float temperature = analogReadTemp();
         if (isfinite(temperature))
-          return ack + ":" + String(temperature, 1);
-        return ackErr + ":Temperature sensor reading is out of range.";
+          return kAck + ":" + String(temperature, 1);
+        return kAckError + ":Temperature sensor reading is out of range.";
       }
     case PARAM_TIME:
-      return ack + ":" + timer.getTimeLeft();
+      return kAck + ":" + timer.getTimeLeft();
     case PARAM_STATE:
-      return ack + ":" + (stateRunning ? "running" : "stopped");
+      return kAck + ":" + (stateRunning ? "running" : "stopped");
     case PARAM_UNKNOWN:
-      return ackErr + ":\"" + paramStr + "\" is not a valid param.";
+      return kAckError + ":\"" + paramStr + "\" is not a valid param.";
   }
-  return ackErr + ":Invalid parameter.";
+  return kAckError + ":Invalid parameter.";
 }
 
 /**
@@ -485,9 +490,9 @@ String modeSetHandler(const String& paramStr, const String& valueStr) {
     case PARAM_STATE:
       return setStatus(valueStr);
     case PARAM_UNKNOWN:
-      return ackErr + ":\"" + paramStr + "\" is not a valid param.";
+      return kAckError + ":\"" + paramStr + "\" is not a valid param.";
   }
-  return ackErr + ":Invalid parameter.";
+  return kAckError + ":Invalid parameter.";
 }
 
 /**
@@ -497,17 +502,17 @@ String modeSetHandler(const String& paramStr, const String& valueStr) {
  */
 String setTemp(const String& tempStr) {
   if (tempStr.isEmpty())
-    return ackErr + ":Temperature is required.";
+    return kAckError + ":Temperature is required.";
   long parsedTemp = 0;
   for (size_t i = 0; i < tempStr.length(); i++) {
     if (!isDigit(tempStr[i]))
-      return ackErr + ":Temperature must be a whole number.";
+      return kAckError + ":Temperature must be a whole number.";
     parsedTemp = parsedTemp * 10 + (tempStr[i] - '0');
-    if (parsedTemp > maxTemp)
-      return ackErr + ":Allowed values range from " + String(minTemp) + " to " + String(maxTemp) + ".";
+    if (parsedTemp > kMaxTemperature)
+      return kAckError + ":Allowed values range from " + String(kMinTemperature) + " to " + String(kMaxTemperature) + ".";
   }
-  if (parsedTemp < minTemp || parsedTemp > maxTemp)
-    return ackErr + ":Allowed values range from " + String(minTemp) + " to " + String(maxTemp) + ".";
+  if (parsedTemp < kMinTemperature || parsedTemp > kMaxTemperature)
+    return kAckError + ":Allowed values range from " + String(kMinTemperature) + " to " + String(kMaxTemperature) + ".";
   const uint8_t temp = static_cast<uint8_t>(parsedTemp);
 
   debugPrintf("Setting up the temperature.\r\n");
@@ -516,11 +521,11 @@ String setTemp(const String& tempStr) {
   if (stateRunning) {
     debugPrintf("Changing temperature to: %d\r\n", tempToSet);
     dial(PARAM_TEMP, tempToSet);
-    return ack;
+    return kAck;
   }
 
   debugPrintf("Temperature to set: %d\r\n", tempToSet);
-  return ack;
+  return kAck;
 }
 
 /**
@@ -530,14 +535,14 @@ String setTemp(const String& tempStr) {
  */
 String setTime(const String& timeStr) {
   if (timeStr.isEmpty())
-    return ackErr + ":Time is required.";
+    return kAckError + ":Time is required.";
   long parsedTime = 0;
   for (size_t i = 0; i < timeStr.length(); i++) {
     if (!isDigit(timeStr[i]))
-      return ackErr + ":Time must be a whole number.";
+      return kAckError + ":Time must be a whole number.";
     parsedTime = parsedTime * 10 + (timeStr[i] - '0');
-    if (parsedTime > maxTime)
-      return ackErr + ":Allowed values range from 0 to " + String(maxTime) + ".";
+    if (parsedTime > kMaxTimeHours)
+      return kAckError + ":Allowed values range from 0 to " + String(kMaxTimeHours) + ".";
   }
   const uint8_t time = static_cast<uint8_t>(parsedTime);
 
@@ -547,11 +552,11 @@ String setTime(const String& timeStr) {
   debugPrintf("Time to set: %dh\r\n", timeToSet);
 
   if (stateRunning) {
-    debugPrintf("Changing time to: %dh\r\n", tempToSet);
+    debugPrintf("Changing time to: %dh\r\n", timeToSet);
     dial(PARAM_TIME, timeToSet);
   }
 
-  return ack;
+  return kAck;
 }
 
 /**
@@ -562,7 +567,7 @@ String setTime(const String& timeStr) {
 String setStatus(const String& stateStr) {
   if (stateStr.equalsIgnoreCase("start")) {
     if (!timeToSet) {
-      return ackErr + ":Cannot start, time not set.";
+      return kAckError + ":Cannot start, time not set.";
     }
 
     dial(PARAM_TEMP, tempToSet);
@@ -573,7 +578,7 @@ String setStatus(const String& stateStr) {
     stateRunning = true;
 
     debugPrintf("Started!\r\n");
-    return ack;
+    return kAck;
   }
   if (stateStr.equalsIgnoreCase("stop")) {
     dial(PARAM_TIME, 0);
@@ -583,10 +588,10 @@ String setStatus(const String& stateStr) {
     stateRunning = false;
 
     debugPrintf("Stopped!\r\n");
-    return ack;
+    return kAck;
   }
 
-  return ackErr + ":\"" + stateStr + "\" is not a valid state.";
+  return kAckError + ":\"" + stateStr + "\" is not a valid state.";
 }
 
 /**
@@ -609,14 +614,14 @@ void dial(Param param, uint8_t value) {
   switch (param) {
     case PARAM_TEMP:
       settingSteps = 1;
-      minValue = minTemp;
-      maxValue = maxTemp;
+      minValue = kMinTemperature;
+      maxValue = kMaxTemperature;
       debugPrintf("Dialing in temperature.\r\n");
       break;
     case PARAM_TIME:
       settingSteps = 2;
       minValue = 0;
-      maxValue = maxTime;
+      maxValue = kMaxTimeHours;
       debugPrintf("Dialing in time.\r\n");
       break;
     default:
@@ -628,77 +633,77 @@ void dial(Param param, uint8_t value) {
   // Select which param to set
   for (int i = 0; i < settingSteps; i++) {
     rotateLeft();
-    delay(1);
+    delay(kEncoderTransitionDelayMs);
   }
 
   // Confirm
   pressButton();
-  delay(1);
+  delay(kEncoderTransitionDelayMs);
 
   // Reset to minimal value
   for (int i = 0; i < maxValue - minValue; i++) {
     rotateRight();
-    delay(1);
+    delay(kEncoderTransitionDelayMs);
   }
 
   // Dial new value
   for (int i = minValue; i < value; i++) {
     rotateLeft();
-    delay(1);
+    delay(kEncoderTransitionDelayMs);
   }
 
   // Confirm settings
   pressButton();
-  delay(1);
+  delay(kEncoderTransitionDelayMs);
 }
 
 /**
  * @brief Emulates encoder single step to the right.
  */
 void rotateRight() {
-  pinMode(pinA, OUTPUT);
-  pinMode(pinB, OUTPUT);
-  delay(1);
+  pinMode(kEncoderPinA, OUTPUT);
+  pinMode(kEncoderPinB, OUTPUT);
+  delay(kEncoderTransitionDelayMs);
 
   setPins(LOW, LOW);
-  delayMicroseconds(500);
+  delayMicroseconds(kEncoderPhaseDelayUs);
   setPins(HIGH, LOW);
-  delayMicroseconds(500);
+  delayMicroseconds(kEncoderPhaseDelayUs);
   setPins(HIGH, HIGH);
-  delay(1);
+  delay(kEncoderTransitionDelayMs);
 
-  pinMode(pinA, INPUT);
-  pinMode(pinB, INPUT);
+  pinMode(kEncoderPinA, INPUT);
+  pinMode(kEncoderPinB, INPUT);
 }
 
 /**
  * @brief Emulates encoder single step to the left.
  */
 void rotateLeft() {
-  pinMode(pinA, OUTPUT);
-  pinMode(pinB, OUTPUT);
-  delay(1);
+  pinMode(kEncoderPinA, OUTPUT);
+  pinMode(kEncoderPinB, OUTPUT);
+  delay(kEncoderTransitionDelayMs);
 
   setPins(LOW, LOW);
-  delayMicroseconds(500);
+  delayMicroseconds(kEncoderPhaseDelayUs);
   setPins(LOW, HIGH);
-  delayMicroseconds(500);
+  delayMicroseconds(kEncoderPhaseDelayUs);
   setPins(HIGH, HIGH);
-  delay(1);
+  delay(kEncoderTransitionDelayMs);
 
-  pinMode(pinA, INPUT);
-  pinMode(pinB, INPUT);
+  pinMode(kEncoderPinA, INPUT);
+  pinMode(kEncoderPinB, INPUT);
 }
 
 /**
  * @brief Emulates encoder button press.
  */
 void pressButton() {
-  pinMode(pinSW, OUTPUT);
-  digitalWrite(pinSW, HIGH);
-  delay(50);
+  pinMode(kEncoderPinSwitch, OUTPUT);
+  digitalWrite(kEncoderPinSwitch, HIGH);
+  delay(kEncoderButtonPressMs);
 
-  pinMode(pinSW, INPUT);
+  pinMode(kEncoderPinSwitch, INPUT);
 }
 
 /**
@@ -707,7 +712,7 @@ void pressButton() {
  * @param a encoder pin A.
  * @param b encoder pin B.
  */
-void setPins(int a, int b) {
-  digitalWrite(pinA, a);
-  digitalWrite(pinB, b);
+void setPins(uint8_t a, uint8_t b) {
+  digitalWrite(kEncoderPinA, a);
+  digitalWrite(kEncoderPinB, b);
 }

@@ -15,9 +15,9 @@ This code was built to be compatible with an ESP32 Mini-D32 board.
 
 The original hardware seems to use the following wiring concept:
 
-- Encoder A -> GPIO 2
-- Encoder B -> GPIO 3
-- Encoder SW -> GPIO 4
+- Encoder A -> GPIO 27
+- Encoder B -> GPIO 25
+- Encoder SW -> GPIO 32
 
 Those are kept as the default GPIOs in the project, but you may need to remap them for your exact wiring and board variant.
 

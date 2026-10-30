@@ -65,3 +65,61 @@ status page. The page shows the current state, the GPIO 35 thermistor reading,
 the ESP32 chip's internal temperature, target temperature, target time, and
 remaining time; it refreshes every five seconds. The chip temperature is the
 ESP32 die temperature, not the dryer temperature.
+
+The page can also set the target temperature and time, and start or stop the
+dryer. The same controls are available over HTTP for automation:
+
+- `GET /api/status` returns JSON with `state`, `temperature`,
+  `chipTemperature`, `targetTemperature`, `targetTime`, and `timeRemaining`.
+- `POST /api/command` accepts a plain-text command using the serial syntax,
+  such as `set temp 55`, `set time 6`, `set state start`, or `set state stop`.
+  Successful commands return `OK`; invalid commands return HTTP 400 and an
+  `ERR:` message.
+
+Example Home Assistant `rest_command` configuration (replace the address with
+the ESP32's IP address):
+
+```yaml
+rest_command:
+  dryer_set_temperature:
+    url: "http://192.168.1.50/api/command"
+    method: POST
+    content_type: "text/plain"
+    payload: "set temp {{ temperature }}"
+  dryer_set_time:
+    url: "http://192.168.1.50/api/command"
+    method: POST
+    content_type: "text/plain"
+    payload: "set time {{ hours }}"
+  dryer_start:
+    url: "http://192.168.1.50/api/command"
+    method: POST
+    content_type: "text/plain"
+    payload: "set state start"
+  dryer_stop:
+    url: "http://192.168.1.50/api/command"
+    method: POST
+    content_type: "text/plain"
+    payload: "set state stop"
+
+To expose the current status in Home Assistant, add a REST sensor:
+
+```yaml
+sensor:
+  - platform: rest
+    name: Dryer Status
+    resource: http://192.168.1.50/api/status
+    value_template: "{{ value_json.state }}"
+    json_attributes:
+      - temperature
+      - chipTemperature
+      - targetTemperature
+      - targetTime
+      - timeRemaining
+    scan_interval: 10
+```
+
+For stable automation, reserve a fixed IP for the ESP32 in your router. The
+API has no authentication and uses plain HTTP: anyone on the same network who
+can reach it can control the dryer. Keep it on a trusted LAN and do not expose
+it directly to the internet.

@@ -1,20 +1,50 @@
 #include <math.h>
 #include <stdarg.h>
+#include <time.h>
 
 #include <Arduino.h>
 #include <WiFi.h>
 #include <WebServer.h>
 #include <WiFiManager.h>
+#include <Preferences.h>
+#include <ArduinoOTA.h>
+#include <Update.h>
+#include <HTTPClient.h>
+#include <WiFiClientSecure.h>
 
 #include "HWTimer.h"
 #include "help.h"
 
+#if __has_include("secrets.h")
+  #include "secrets.h"
+#endif
+
+#ifndef DRYER_WIFI_SETUP_PASSWORD
+  #define DRYER_WIFI_SETUP_PASSWORD "dryer_cntrl_esp32"
+#endif
+
 constexpr bool kDebugEnabled = false;
+constexpr char kFirmwareVersion[] = "0.4.0";
 constexpr uint32_t kSerialBaudRate = 115200;
 constexpr uint16_t kWebServerPort = 80;
 constexpr char kWifiSetupSsid[] = "DryerController-Setup";
+constexpr char kOtaHostname[] = "dryer-controller";
+constexpr char kWifiSetupPassword[] = DRYER_WIFI_SETUP_PASSWORD;
+static_assert(sizeof(kWifiSetupPassword) >= 9, "Wi-Fi setup password must be at least 8 characters");
+constexpr char kCredentialsNamespace[] = "dryer-auth";
+constexpr char kCredentialsKey[] = "credentials";
+constexpr char kAuthEnabledKey[] = "authEnabled";
+constexpr char kRecoveryNamespace[] = "recovery";
+constexpr char kPowerCycleCountKey[] = "powerCycles";
+constexpr uint8_t kFactoryResetPowerCycleCount = 10;
+constexpr uint32_t kFactoryResetWindowMs = 60000;
+constexpr time_t kMinimumTlsVerificationEpoch = 1704067200;
+constexpr size_t kMaxUsernameLength = 32;
+constexpr size_t kMinPasswordLength = 8;
+constexpr size_t kMaxPasswordLength = 64;
 constexpr size_t kDebugBufferSize = 255;
 constexpr uint16_t kStartupDelayMs = 1000;
+constexpr uint32_t kTlsClockSyncTimeoutMs = 10000;
 constexpr uint8_t kEncoderTransitionDelayMs = 1;
 constexpr uint16_t kEncoderPhaseDelayUs = 500;
 constexpr uint8_t kEncoderButtonPressMs = 50;
@@ -60,16 +90,47 @@ constexpr uint8_t kMaxTimeHours = 24; // Hours
 static bool stateRunning = false;
 static uint8_t tempToSet = 0;
 static uint8_t timeToSet = 0;
+static String httpUsername;
+static String httpPassword;
+static bool httpAuthEnabled = true;
+static bool powerCycleResetPending = false;
+static bool otaStarted = false;
+static bool firmwareUploadStarted = false;
+static bool firmwareUploadAuthorized = false;
+static bool firmwareUploadFailed = false;
+static bool firmwareUploadComplete = false;
+static String firmwareUploadError;
 
 /* Timer */
 HWTimer timer;
 WebServer webServer(kWebServerPort);
 
+class DefaultBundleWiFiClientSecure : public WiFiClientSecure {
+public:
+  void useDefaultCACertBundle() {
+    _use_ca_bundle = true;
+  }
+};
+
 void debugPrintf(const char* fmt, ...);
 void handleStatusPage();
 void handleStatusApi();
 void handleCommandApi();
+void handleCredentialsApi();
+void handleAuthApi();
+void handleFirmwareUploadComplete();
+void handleFirmwareUpload();
+void handleFirmwareUrlUpdate();
 void startWifiAndWebServer();
+void startOtaUpdates();
+bool authenticateHttpRequest();
+bool authenticateFirmwareRequest();
+bool downloadFirmwareFromUrl(const String& url, String& error);
+void sendCredentialSetupPage();
+bool saveHttpCredentials(const String& username, const String& password);
+bool saveHttpAuthEnabled(bool enabled);
+bool recordPowerCycleAndResetIfNeeded(WiFiManager& wifiManager);
+void clearPowerCycleCountAfterWindow();
 String inputHandler(const String& input);
 String modeGetHandler(const String& paramStr);
 String modeSetHandler(const String& paramStr, const String& valueStr);
@@ -120,6 +181,9 @@ void loop() {
 
   timer.update();
   webServer.handleClient();
+  if (otaStarted)
+    ArduinoOTA.handle();
+  clearPowerCycleCountAfterWindow();
 
   if (!Serial.available())
     return;
@@ -154,23 +218,151 @@ void loop() {
 
 void startWifiAndWebServer() {
   WiFiManager wifiManager;
-  if (!wifiManager.autoConnect(kWifiSetupSsid)) {
+  if (recordPowerCycleAndResetIfNeeded(wifiManager))
+    return;
+
+  if (!wifiManager.autoConnect(kWifiSetupSsid, kWifiSetupPassword)) {
     Serial.println("ERR: Wi-Fi setup failed; restarting.");
     delay(1000);
     ESP.restart();
     return;
   }
 
+  Preferences preferences;
+  if (preferences.begin(kCredentialsNamespace, false)) {
+    const String storedCredentials = preferences.getString(kCredentialsKey, "");
+    httpAuthEnabled = preferences.getBool(kAuthEnabledKey, false);
+    preferences.end();
+    const int separator = storedCredentials.indexOf('\n');
+    if (separator > 0) {
+      httpUsername = storedCredentials.substring(0, separator);
+      httpPassword = storedCredentials.substring(separator + 1);
+    } else {
+      Serial.println("No HTTP login configured; create one on the web page.");
+    }
+  } else {
+    Serial.println("ERR: Could not open HTTP credential storage; web login setup may fail.");
+  }
+
   webServer.on("/", HTTP_GET, handleStatusPage);
   webServer.on("/api/status", HTTP_GET, handleStatusApi);
   webServer.on("/api/command", HTTP_POST, handleCommandApi);
+  webServer.on("/api/credentials", HTTP_POST, handleCredentialsApi);
+  webServer.on("/api/auth", HTTP_POST, handleAuthApi);
+  webServer.on("/api/firmware/upload", HTTP_POST, handleFirmwareUploadComplete,
+               handleFirmwareUpload);
+  webServer.on("/api/firmware/url", HTTP_POST, handleFirmwareUrlUpdate);
   webServer.begin();
+  startOtaUpdates();
 
   Serial.printf("Wi-Fi connected. Status page: http://%s/\r\n",
                 WiFi.localIP().toString().c_str());
 }
 
+void startOtaUpdates() {
+  if (httpUsername.isEmpty() || httpPassword.isEmpty()) {
+    Serial.println("OTA disabled until an HTTP login is configured.");
+    return;
+  }
+
+  ArduinoOTA.setHostname(kOtaHostname);
+  ArduinoOTA.setPassword(httpPassword.c_str());
+  ArduinoOTA.onStart([]() {
+    Serial.println("OTA update started.");
+  });
+  ArduinoOTA.onEnd([]() {
+    Serial.println("\r\nOTA update complete.");
+  });
+  ArduinoOTA.onError([](ota_error_t error) {
+    Serial.printf("OTA update failed (error %u).\r\n", error);
+  });
+  ArduinoOTA.begin();
+  otaStarted = true;
+  Serial.printf("OTA ready at %s.local; password is the configured HTTP password.\r\n",
+                kOtaHostname);
+}
+
+bool recordPowerCycleAndResetIfNeeded(WiFiManager& wifiManager) {
+  Preferences recovery;
+  if (!recovery.begin(kRecoveryNamespace, false)) {
+    Serial.println("ERR: Could not open power-cycle recovery storage.");
+    return false;
+  }
+
+  uint8_t powerCycles = recovery.getUChar(kPowerCycleCountKey, 0);
+  if (powerCycles < kFactoryResetPowerCycleCount)
+    ++powerCycles;
+  if (!recovery.putUChar(kPowerCycleCountKey, powerCycles)) {
+    Serial.println("ERR: Could not save power-cycle count.");
+    recovery.end();
+    return false;
+  }
+  recovery.end();
+  powerCycleResetPending = true;
+
+  Serial.printf("Power cycle recovery count: %u/%u\r\n",
+                powerCycles, kFactoryResetPowerCycleCount);
+  if (powerCycles < kFactoryResetPowerCycleCount)
+    return false;
+
+  Preferences credentials;
+  if (!credentials.begin(kCredentialsNamespace, false)) {
+    Serial.println("ERR: Factory reset could not clear HTTP credentials.");
+    return false;
+  }
+  const bool credentialsCleared = credentials.clear();
+  credentials.end();
+  if (!credentialsCleared) {
+    Serial.println("ERR: Factory reset could not clear HTTP credentials.");
+    return false;
+  }
+
+  if (!recovery.begin(kRecoveryNamespace, false)) {
+    Serial.println("ERR: Factory reset could not clear its power-cycle count.");
+    return false;
+  }
+  const bool countCleared = recovery.putUChar(kPowerCycleCountKey, 0);
+  recovery.end();
+  if (!countCleared) {
+    Serial.println("ERR: Factory reset could not clear its power-cycle count.");
+    return false;
+  }
+
+  Serial.println("Factory reset: clearing saved Wi-Fi and HTTP settings.");
+  wifiManager.resetSettings();
+  delay(kStartupDelayMs);
+  ESP.restart();
+  return true;
+}
+
+void clearPowerCycleCountAfterWindow() {
+  if (!powerCycleResetPending || millis() < kFactoryResetWindowMs)
+    return;
+
+  Preferences recovery;
+  if (!recovery.begin(kRecoveryNamespace, false)) {
+    Serial.println("ERR: Could not clear power-cycle recovery count.");
+    return;
+  }
+  const bool cleared = recovery.putUChar(kPowerCycleCountKey, 0);
+  recovery.end();
+  if (!cleared) {
+    Serial.println("ERR: Could not clear power-cycle recovery count.");
+    return;
+  }
+
+  powerCycleResetPending = false;
+}
+
 void handleStatusPage() {
+  if (httpAuthEnabled && (httpUsername.isEmpty() || httpPassword.isEmpty())) {
+    sendCredentialSetupPage();
+    return;
+  }
+
+  if (!authenticateHttpRequest())
+    return;
+
   static const char page[] PROGMEM = R"html(
 <!doctype html>
 <html lang="en">
@@ -193,6 +385,8 @@ void handleStatusPage() {
   button:hover{border-color:var(--accent)}
   :focus-visible{outline:2px solid var(--accent);outline-offset:2px}
   #result{min-height:1.5em}
+  input{font:inherit;padding:.45rem;color:var(--text);background:var(--card);border:1px solid var(--border);border-radius:6px}
+  input[type="checkbox"]{width:auto}
   </style>
 </head>
 <body>
@@ -225,6 +419,42 @@ void handleStatusPage() {
       <button type="button" id="stopButton">Stop</button>
       <p id="result" role="status"></p>
     </fieldset>
+    <details>
+      <summary>HTTP login settings</summary>
+      <form id="credentialsForm">
+        <label>New username
+          <input id="usernameInput" name="username" maxlength="32" autocomplete="username" required>
+        </label>
+        <label>New password (at least 8 characters)
+          <input id="passwordInput" name="password" type="password" minlength="8" maxlength="64"
+                 autocomplete="new-password" required>
+        </label>
+        <label><input id="showPassword" type="checkbox"> Show password</label>
+        <button type="submit">Save login</button>
+      </form>
+      <p>Saving new credentials will require signing in again.</p>
+      <p>HTTP Basic Auth: <strong id="authState">Loading…</strong></p>
+      <button type="button" id="authToggleButton">Loading…</button>
+    </details>
+    <details>
+      <summary>Firmware updates</summary>
+      <p>Current firmware version: <strong id="firmwareVersion">Loading…</strong></p>
+      <p>Updates require the configured HTTP username and password, even if dashboard Basic Auth is disabled. Use a firmware .bin built for this device.</p>
+      <form id="firmwareUploadForm">
+        <label>Upload firmware file
+          <input id="firmwareFile" type="file" accept=".bin,application/octet-stream" required>
+        </label>
+        <button type="submit">Upload and install</button>
+      </form>
+      <form id="firmwareUrlForm">
+        <label>Or install from an HTTPS URL
+          <input id="firmwareUrl" type="url" maxlength="512" placeholder="https://example.com/firmware.bin" required>
+        </label>
+        <button type="submit">Download and install</button>
+      </form>
+      <progress id="firmwareProgress" max="100" value="0" hidden></progress>
+      <p id="firmwareResult" role="status"></p>
+    </details>
   </main>
   <script>
     const themeButton = document.getElementById('themeButton');
@@ -238,6 +468,10 @@ void handleStatusPage() {
     setTheme('dark');
     themeButton.addEventListener('click', () => {
       setTheme(document.documentElement.dataset.theme === 'dark' ? 'light' : 'dark');
+    });
+
+    document.getElementById('showPassword').addEventListener('change', event => {
+      document.getElementById('passwordInput').type = event.currentTarget.checked ? 'text' : 'password';
     });
 
     function populateSelect(select, min, max, suffix) {
@@ -289,6 +523,115 @@ void handleStatusPage() {
     document.getElementById('startButton').addEventListener('click', () => sendCommand('set state start'));
     document.getElementById('stopButton').addEventListener('click', () => sendCommand('set state stop'));
 
+    document.getElementById('credentialsForm').addEventListener('submit', async event => {
+      event.preventDefault();
+      const result = document.getElementById('result');
+      const body = new URLSearchParams({
+        username: document.getElementById('usernameInput').value,
+        password: document.getElementById('passwordInput').value
+      });
+      try {
+        const response = await fetch('/api/credentials', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+          body
+        });
+        result.textContent = await response.text();
+        if (response.ok)
+          result.textContent += ' Reload the page and sign in with the new credentials.';
+      } catch (error) {
+        result.textContent = 'Could not save credentials; check the connection.';
+      }
+    });
+
+    document.getElementById('firmwareUploadForm').addEventListener('submit', event => {
+      event.preventDefault();
+      const file = document.getElementById('firmwareFile').files[0];
+      const result = document.getElementById('firmwareResult');
+      const progress = document.getElementById('firmwareProgress');
+      if (!file) {
+        result.textContent = 'Choose a firmware .bin file first.';
+        return;
+      }
+
+      const formData = new FormData();
+      formData.append('firmware', file);
+      progress.hidden = false;
+      progress.value = 0;
+      result.textContent = 'Uploading firmware…';
+      const request = new XMLHttpRequest();
+      request.open('POST', '/api/firmware/upload');
+      request.upload.addEventListener('progress', uploadEvent => {
+        if (uploadEvent.lengthComputable)
+          progress.value = Math.round(uploadEvent.loaded * 100 / uploadEvent.total);
+      });
+      request.addEventListener('load', () => {
+        result.textContent = request.responseText || 'Firmware upload failed.';
+        if (request.status >= 200 && request.status < 300)
+          setTimeout(() => location.reload(), 5000);
+      });
+      request.addEventListener('error', () => {
+        result.textContent = 'Firmware upload failed; check the connection.';
+      });
+      request.send(formData);
+    });
+
+    document.getElementById('firmwareUrlForm').addEventListener('submit', async event => {
+      event.preventDefault();
+      const result = document.getElementById('firmwareResult');
+      result.textContent = 'Downloading and installing firmware…';
+      try {
+        const response = await fetch('/api/firmware/url', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+          body: new URLSearchParams({url: document.getElementById('firmwareUrl').value})
+        });
+        result.textContent = await response.text();
+        if (response.ok)
+          setTimeout(() => location.reload(), 5000);
+      } catch (error) {
+        result.textContent = 'Firmware download failed; check the connection.';
+      }
+    });
+
+    function updateAuthControl(enabled, credentialsConfigured) {
+      const button = document.getElementById('authToggleButton');
+      button.dataset.enabled = String(enabled);
+      button.dataset.credentialsConfigured = String(credentialsConfigured);
+      button.textContent = enabled ? 'Disable HTTP Basic Auth'
+        : credentialsConfigured ? 'Enable HTTP Basic Auth' : 'Set up login to enable Basic Auth';
+      document.getElementById('authState').textContent = enabled ? 'Enabled' : 'Disabled';
+    }
+
+    document.getElementById('authToggleButton').addEventListener('click', async () => {
+      const button = document.getElementById('authToggleButton');
+      if (button.dataset.credentialsConfigured !== 'true') {
+        const settings = document.querySelector('details');
+        settings.open = true;
+        document.getElementById('usernameInput').focus();
+        document.getElementById('result').textContent =
+          'Set a username and password before enabling HTTP Basic Auth.';
+        return;
+      }
+      const enable = button.dataset.enabled !== 'true';
+      try {
+        const response = await fetch('/api/auth', {
+          method: 'POST',
+          headers: {'Content-Type': 'text/plain'},
+          body: enable ? 'enabled' : 'disabled'
+        });
+        const message = await response.text();
+        document.getElementById('result').textContent = message;
+        if (response.ok) {
+          updateAuthControl(enable);
+          if (enable)
+            document.getElementById('result').textContent += ' Further requests will require login.';
+        }
+      } catch (error) {
+        document.getElementById('result').textContent = 'Could not change authentication setting.';
+      }
+    });
+
     async function refreshStatus() {
       try {
         const response = await fetch('/api/status', {cache: 'no-store'});
@@ -302,6 +645,8 @@ void handleStatusPage() {
           status.targetTemperature || 'Not set';
         document.getElementById('targetTime').textContent = status.targetTime;
         document.getElementById('timeRemaining').textContent = status.timeRemaining;
+        document.getElementById('firmwareVersion').textContent = status.firmwareVersion;
+        updateAuthControl(status.httpAuthEnabled, status.httpCredentialsConfigured);
         if (status.targetTemperature >= 45 && status.targetTemperature <= 65
             && document.activeElement !== temperatureInput && !temperatureInput.matches(':hover'))
           temperatureInput.value = status.targetTemperature;
@@ -322,11 +667,85 @@ void handleStatusPage() {
   webServer.send(200, "text/html; charset=utf-8", page);
 }
 
+void sendCredentialSetupPage() {
+  static const char page[] PROGMEM = R"html(
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Set dryer login</title>
+  <style>
+  :root{color-scheme:dark;--page:#111820;--card:#1c2732;--text:#edf3f8;--muted:#b3c0cc;--border:#536273;--accent:#79baff}
+  body{font:16px system-ui,sans-serif;max-width:32rem;margin:3rem auto;padding:0 1rem;background:var(--page);color:var(--text)}
+  main{background:var(--card);border-radius:12px;padding:1.5rem}
+  label{display:block;margin:1rem 0;color:var(--muted)}
+  input,button{font:inherit;padding:.55rem;color:var(--text);background:var(--card);border:1px solid var(--border);border-radius:6px}
+  input{display:block;width:calc(100% - 1.2rem);margin-top:.35rem}
+  input[type="checkbox"]{display:inline;width:auto;margin-right:.4rem}
+  button{cursor:pointer}button:hover{border-color:var(--accent)}
+  :focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Set dryer login</h1>
+    <p>Create a username and password to protect the dashboard and control API.</p>
+    <form id="setupForm">
+      <label>Username (1–32 printable characters, no spaces or colons)
+        <input name="username" maxlength="32" autocomplete="username" required>
+      </label>
+      <label>Password (8–64 characters)
+        <input name="password" type="password" minlength="8" maxlength="64"
+               autocomplete="new-password" required>
+      </label>
+      <label><input id="showSetupPassword" type="checkbox"> Show password</label>
+      <button type="submit">Save login</button>
+    </form>
+    <p id="result" role="status"></p>
+  </main>
+  <script>
+    document.getElementById('showSetupPassword').addEventListener('change', event => {
+      document.querySelector('input[name="password"]').type =
+        event.currentTarget.checked ? 'text' : 'password';
+    });
+
+    document.getElementById('setupForm').addEventListener('submit', async event => {
+      event.preventDefault();
+      const result = document.getElementById('result');
+      const body = new URLSearchParams(new FormData(event.currentTarget));
+      try {
+        const response = await fetch('/api/credentials', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+          body
+        });
+        result.textContent = await response.text();
+        if (response.ok) {
+          result.textContent += ' Reloading; sign in with the credentials you just created.';
+          setTimeout(() => location.reload(), 1500);
+        }
+      } catch (error) {
+        result.textContent = 'Could not save credentials; check the connection.';
+      }
+    });
+  </script>
+</body>
+</html>
+)html";
+  webServer.send(200, "text/html; charset=utf-8", page);
+}
+
 void handleStatusApi() {
+  if (!authenticateHttpRequest())
+    return;
+
   String json;
-  json.reserve(128);
+  json.reserve(256);
   json = "{\"state\":\"";
   json += stateRunning ? "running" : "stopped";
+  json += "\",\"firmwareVersion\":\"";
+  json += kFirmwareVersion;
   json += "\",\"temperature\":";
   const float temperature = analogReadTemp();
   json += isfinite(temperature) ? String(temperature, 1) : "null";
@@ -338,12 +757,19 @@ void handleStatusApi() {
   json += String(timeToSet);
   json += ",\"timeRemaining\":\"";
   json += timer.getTimeLeft();
-  json += "\"}";
+  json += "\",\"httpAuthEnabled\":";
+  json += httpAuthEnabled ? "true" : "false";
+  json += ",\"httpCredentialsConfigured\":";
+  json += !httpUsername.isEmpty() && !httpPassword.isEmpty() ? "true" : "false";
+  json += "}";
 
   webServer.send(200, "application/json; charset=utf-8", json);
 }
 
 void handleCommandApi() {
+  if (!authenticateHttpRequest())
+    return;
+
   String command = webServer.arg("plain");
   command.trim();
   if (command.isEmpty() || command.length() > 64) {
@@ -354,6 +780,293 @@ void handleCommandApi() {
   const String response = inputHandler(command);
   const bool failed = response.startsWith(kAckError);
   webServer.send(failed ? 400 : 200, "text/plain; charset=utf-8", response);
+}
+
+void handleCredentialsApi() {
+  const bool isSetup = httpUsername.isEmpty() || httpPassword.isEmpty();
+  if (!isSetup && !authenticateHttpRequest())
+    return;
+
+  const String username = webServer.arg("username");
+  const String password = webServer.arg("password");
+  bool validUsername = !username.isEmpty() && username.length() <= kMaxUsernameLength;
+  for (size_t i = 0; validUsername && i < username.length(); i++) {
+    validUsername = username[i] >= 0x21 && username[i] <= 0x7e && username[i] != ':';
+  }
+  if (!validUsername) {
+    webServer.send(400, "text/plain; charset=utf-8",
+                   "Username must be 1-32 printable ASCII characters without spaces or colons.");
+    return;
+  }
+  if (password.length() < kMinPasswordLength || password.length() > kMaxPasswordLength) {
+    webServer.send(400, "text/plain; charset=utf-8", "Password must be 8-64 characters.");
+    return;
+  }
+  for (size_t i = 0; i < password.length(); i++) {
+    if (password[i] < 0x20 || password[i] > 0x7e) {
+      webServer.send(400, "text/plain; charset=utf-8", "Password must use printable ASCII characters.");
+      return;
+    }
+  }
+
+  if (!saveHttpCredentials(username, password)) {
+    webServer.send(500, "text/plain; charset=utf-8", "Could not save credentials to NVS.");
+    return;
+  }
+
+  webServer.send(200, "text/plain; charset=utf-8", "Credentials saved.");
+}
+
+void handleAuthApi() {
+  if (!authenticateHttpRequest())
+    return;
+
+  String setting = webServer.arg("plain");
+  setting.trim();
+  if (setting != "enabled" && setting != "disabled") {
+    webServer.send(400, "text/plain; charset=utf-8", "Expected 'enabled' or 'disabled'.");
+    return;
+  }
+
+  const bool enabled = setting == "enabled";
+  if (enabled && (httpUsername.isEmpty() || httpPassword.isEmpty())) {
+    webServer.send(400, "text/plain; charset=utf-8", "Set an HTTP username and password first.");
+    return;
+  }
+  if (!saveHttpAuthEnabled(enabled)) {
+    webServer.send(500, "text/plain; charset=utf-8", "Could not save auth setting to NVS.");
+    return;
+  }
+
+  webServer.send(200, "text/plain; charset=utf-8",
+                 enabled ? "HTTP Basic Auth enabled." : "HTTP Basic Auth disabled.");
+}
+
+void handleFirmwareUpload() {
+  HTTPUpload& upload = webServer.upload();
+  if (upload.status == UPLOAD_FILE_START) {
+    firmwareUploadStarted = true;
+    firmwareUploadAuthorized = authenticateFirmwareRequest();
+    firmwareUploadFailed = !firmwareUploadAuthorized;
+    firmwareUploadComplete = false;
+    firmwareUploadError = "";
+    if (!firmwareUploadAuthorized)
+      return;
+
+    String filename = upload.filename;
+    filename.toLowerCase();
+    if (!filename.endsWith(".bin")) {
+      firmwareUploadFailed = true;
+      firmwareUploadError = "Choose a firmware .bin file.";
+      return;
+    }
+    if (!Update.begin(UPDATE_SIZE_UNKNOWN)) {
+      firmwareUploadFailed = true;
+      firmwareUploadError = Update.errorString();
+    }
+    return;
+  }
+
+  if (!firmwareUploadAuthorized)
+    return;
+
+  if (upload.status == UPLOAD_FILE_WRITE && !firmwareUploadFailed) {
+    const size_t written = Update.write(upload.buf, upload.currentSize);
+    if (written != upload.currentSize) {
+      firmwareUploadFailed = true;
+      firmwareUploadError = Update.errorString();
+      if (firmwareUploadError.isEmpty())
+        firmwareUploadError = "Could not write the firmware image.";
+      Update.abort();
+    }
+  } else if (upload.status == UPLOAD_FILE_END && !firmwareUploadFailed) {
+    firmwareUploadComplete = Update.end(true);
+    if (!firmwareUploadComplete) {
+      firmwareUploadFailed = true;
+      firmwareUploadError = Update.errorString();
+    }
+  } else if (upload.status == UPLOAD_FILE_ABORTED) {
+    Update.abort();
+    firmwareUploadFailed = true;
+    firmwareUploadError = "Firmware upload was interrupted.";
+  }
+}
+
+void handleFirmwareUploadComplete() {
+  if (!firmwareUploadStarted) {
+    if (!authenticateFirmwareRequest())
+      return;
+    webServer.send(400, "text/plain; charset=utf-8", "Choose a firmware .bin file.");
+    return;
+  }
+  if (!firmwareUploadAuthorized) {
+    firmwareUploadStarted = false;
+    return;
+  }
+  if (firmwareUploadFailed || !firmwareUploadComplete) {
+    const String message = firmwareUploadError.isEmpty()
+        ? "Firmware upload failed."
+        : firmwareUploadError;
+    webServer.send(400, "text/plain; charset=utf-8", message);
+    firmwareUploadStarted = false;
+    firmwareUploadAuthorized = false;
+    firmwareUploadFailed = false;
+    firmwareUploadComplete = false;
+    return;
+  }
+
+  webServer.send(200, "text/plain; charset=utf-8",
+                 "Firmware uploaded successfully. The device is restarting.");
+  firmwareUploadStarted = false;
+  delay(1000);
+  ESP.restart();
+}
+
+void handleFirmwareUrlUpdate() {
+  if (!authenticateFirmwareRequest())
+    return;
+
+  String url = webServer.arg("url");
+  url.trim();
+  if (url.length() > 512 || !url.startsWith("https://")) {
+    webServer.send(400, "text/plain; charset=utf-8",
+                   "Enter an HTTPS firmware URL no longer than 512 characters.");
+    return;
+  }
+
+  String error;
+  if (!downloadFirmwareFromUrl(url, error)) {
+    webServer.send(400, "text/plain; charset=utf-8", error);
+    return;
+  }
+
+  webServer.send(200, "text/plain; charset=utf-8",
+                 "Firmware downloaded successfully. The device is restarting.");
+  delay(1000);
+  ESP.restart();
+}
+
+bool downloadFirmwareFromUrl(const String& url, String& error) {
+  configTime(0, 0, "pool.ntp.org", "time.google.com");
+  const uint32_t syncStartedAt = millis();
+  while (time(nullptr) < kMinimumTlsVerificationEpoch
+         && millis() - syncStartedAt < kTlsClockSyncTimeoutMs)
+    delay(250);
+  if (time(nullptr) < kMinimumTlsVerificationEpoch) {
+    error = "Could not synchronize the clock for HTTPS certificate verification.";
+    return false;
+  }
+
+  DefaultBundleWiFiClientSecure client;
+  client.useDefaultCACertBundle();
+
+  HTTPClient http;
+  http.setConnectTimeout(15000);
+  http.setTimeout(30000);
+  http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+  if (!http.begin(client, url)) {
+    error = "Could not start the HTTPS firmware download.";
+    return false;
+  }
+
+  const int responseCode = http.GET();
+  if (responseCode != HTTP_CODE_OK) {
+    error = "Firmware download failed with HTTP status " + String(responseCode) + ".";
+    http.end();
+    return false;
+  }
+
+  const int firmwareSize = http.getSize();
+  if (firmwareSize <= 0) {
+    error = "The firmware server must provide a content length.";
+    http.end();
+    return false;
+  }
+  if (!Update.begin(static_cast<size_t>(firmwareSize))) {
+    error = String("Could not start firmware update: ") + Update.errorString();
+    http.end();
+    return false;
+  }
+
+  const size_t written = Update.writeStream(http.getStream());
+  if (written != static_cast<size_t>(firmwareSize)) {
+    error = String("Firmware download was incomplete: ") + Update.errorString();
+    Update.abort();
+    http.end();
+    return false;
+  }
+
+  const bool updated = Update.end();
+  if (!updated) {
+    error = String("Firmware image was rejected: ") + Update.errorString();
+    Update.abort();
+  }
+  http.end();
+  return updated;
+}
+
+bool saveHttpCredentials(const String& username, const String& password) {
+  Preferences preferences;
+  if (!preferences.begin(kCredentialsNamespace, false))
+    return false;
+
+  String credentials;
+  credentials.reserve(username.length() + password.length() + 1);
+  credentials = username;
+  credentials += '\n';
+  credentials += password;
+  const size_t bytesWritten = preferences.putString(kCredentialsKey, credentials);
+  const bool saved = bytesWritten > 0
+      && preferences.getString(kCredentialsKey, "") == credentials;
+  preferences.end();
+  if (saved) {
+    httpUsername = username;
+    httpPassword = password;
+    if (otaStarted)
+      ArduinoOTA.setPassword(httpPassword.c_str());
+    else
+      startOtaUpdates();
+  }
+  return saved;
+}
+
+bool saveHttpAuthEnabled(bool enabled) {
+  Preferences preferences;
+  if (!preferences.begin(kCredentialsNamespace, false))
+    return false;
+
+  const bool saved = preferences.putBool(kAuthEnabledKey, enabled);
+  preferences.end();
+  if (saved)
+    httpAuthEnabled = enabled;
+  return saved;
+}
+
+bool authenticateHttpRequest() {
+  if (!httpAuthEnabled)
+    return true;
+  if (httpUsername.isEmpty() || httpPassword.isEmpty()) {
+    webServer.send(503, "text/plain; charset=utf-8", "Create HTTP credentials at / before using the API.");
+    return false;
+  }
+  if (webServer.authenticate(httpUsername.c_str(), httpPassword.c_str()))
+    return true;
+
+  webServer.requestAuthentication(BASIC_AUTH, "Dryer Controller");
+  return false;
+}
+
+bool authenticateFirmwareRequest() {
+  if (httpUsername.isEmpty() || httpPassword.isEmpty()) {
+    webServer.send(503, "text/plain; charset=utf-8",
+                   "Configure an HTTP username and password before installing firmware.");
+    return false;
+  }
+  if (webServer.authenticate(httpUsername.c_str(), httpPassword.c_str()))
+    return true;
+
+  webServer.requestAuthentication(BASIC_AUTH, "Firmware Update");
+  return false;
 }
 
 /**
